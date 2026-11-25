@@ -1,4 +1,4 @@
-# Commonplace Goods storefront
+# E-COMMERCE — Commonplace Goods storefront
 
 A responsive e-commerce storefront built with React and Vite.
 

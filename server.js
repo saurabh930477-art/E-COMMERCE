@@ -11,6 +11,7 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const isProduction = process.env.NODE_ENV === 'production';
 const port = Number(process.env.PORT || (isProduction ? 5173 : 3001));
 const sessionDuration = 30 * 24 * 60 * 60 * 1000;
+const passwordResetDuration = 15 * 60 * 1000;
 const sessionCookie = 'commonplace_session';
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -32,6 +33,11 @@ database.exec(`
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     expires_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS password_resets (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS reviews (
     id INTEGER PRIMARY KEY,
     product_id TEXT NOT NULL,
@@ -43,6 +49,7 @@ database.exec(`
   );
 `);
 database.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
+database.prepare('DELETE FROM password_resets WHERE expires_at <= ?').run(Date.now());
 
 const app = express();
 app.disable('x-powered-by');
@@ -108,6 +115,13 @@ const reviewRateLimit = rateLimit({
   standardHeaders: 'draft-8',
   legacyHeaders: false,
   message: { error: 'Too many review submissions. Please wait and try again.' },
+});
+const passwordResetRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: isProduction ? 5 : 20,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many password reset requests. Please wait and try again.' },
 });
 const asyncRoute = (handler) => (request, response, next) => {
   Promise.resolve(handler(request, response, next)).catch(next);
@@ -224,6 +238,75 @@ app.post('/api/auth/login', authRateLimit, asyncRoute(async (request, response) 
   response.json({ user: { id: user.id, name: user.name, email: user.email } });
 }));
 
+app.post('/api/auth/forgot-password', passwordResetRateLimit, (request, response) => {
+  if (isProduction) {
+    response.status(503).json({ error: 'Password reset is unavailable because email delivery is not configured.' });
+    return;
+  }
+
+  const email = typeof request.body?.email === 'string' ? request.body.email.trim().toLowerCase() : '';
+  if (!emailPattern.test(email) || email.length > 254) {
+    response.status(400).json({ error: 'Enter a valid email address.' });
+    return;
+  }
+
+  const user = database.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  const token = randomBytes(32).toString('base64url');
+  if (user) {
+    const saveReset = database.transaction(() => {
+      database.prepare('DELETE FROM password_resets WHERE user_id = ?').run(user.id);
+      database.prepare('INSERT INTO password_resets (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
+        .run(hashToken(token), user.id, Date.now() + passwordResetDuration);
+    });
+    saveReset();
+  }
+
+  response.json({
+    message: 'If an account exists, a local password reset link is ready.',
+    resetToken: token,
+  });
+});
+
+app.post('/api/auth/reset-password', passwordResetRateLimit, asyncRoute(async (request, response) => {
+  if (isProduction) {
+    response.status(503).json({ error: 'Password reset is unavailable because email delivery is not configured.' });
+    return;
+  }
+
+  const token = typeof request.body?.token === 'string' ? request.body.token : '';
+  const password = typeof request.body?.password === 'string' ? request.body.password : '';
+  if (!token || token.length > 128 || password.length < 8 || password.length > 128) {
+    response.status(400).json({ error: 'Use a valid reset link and a password between 8 and 128 characters.' });
+    return;
+  }
+
+  const tokenHash = hashToken(token);
+  const reset = database.prepare('SELECT user_id FROM password_resets WHERE token_hash = ? AND expires_at > ?')
+    .get(tokenHash, Date.now());
+  if (!reset) {
+    response.status(400).json({ error: 'This reset link is invalid or expired. Request a new one.' });
+    return;
+  }
+
+  const passwordHash = await bcrypt.hash(password, 12);
+  const consumeReset = database.transaction(() => {
+    const currentReset = database.prepare('SELECT user_id FROM password_resets WHERE token_hash = ? AND expires_at > ?')
+      .get(tokenHash, Date.now());
+    if (!currentReset) return false;
+
+    database.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, currentReset.user_id);
+    database.prepare('DELETE FROM password_resets WHERE token_hash = ?').run(tokenHash);
+    database.prepare('DELETE FROM sessions WHERE user_id = ?').run(currentReset.user_id);
+    return true;
+  });
+  if (!consumeReset()) {
+    response.status(400).json({ error: 'This reset link is invalid or expired. Request a new one.' });
+    return;
+  }
+
+  response.json({ message: 'Your password has been reset. Sign in with your new password.' });
+}));
+
 app.get('/api/auth/me', (request, response) => {
   const token = getCookie(request, sessionCookie);
   if (!token) {
@@ -238,6 +321,33 @@ app.get('/api/auth/me', (request, response) => {
     return;
   }
   response.json({ user });
+});
+
+app.patch('/api/auth/profile', (request, response) => {
+  const user = getSessionUser(request);
+  if (!user) {
+    response.status(401).json({ error: 'Sign in to update your profile.' });
+    return;
+  }
+
+  const name = typeof request.body?.name === 'string' ? request.body.name.trim() : '';
+  const email = typeof request.body?.email === 'string' ? request.body.email.trim().toLowerCase() : '';
+  if (!name || name.length > 80 || !emailPattern.test(email) || email.length > 254) {
+    response.status(400).json({ error: 'Enter a name of up to 80 characters and a valid email address.' });
+    return;
+  }
+
+  try {
+    database.prepare('UPDATE users SET name = ?, email = ? WHERE id = ?').run(name, email, user.id);
+  } catch (error) {
+    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+      response.status(409).json({ error: 'An account with this email already exists.' });
+      return;
+    }
+    throw error;
+  }
+
+  response.json({ user: { id: user.id, name, email } });
 });
 
 app.post('/api/auth/logout', (request, response) => {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import './shop.css';
 
 const products = [
@@ -46,6 +46,7 @@ function Icon({ name, size = 20 }) {
     arrow: <><path d="M5 12h14M13 6l6 6-6 6" /></>,
     check: <path d="m5 12 4 4L19 6" />,
     user: <><circle cx="12" cy="8" r="4" /><path d="M5 21a7 7 0 0 1 14 0" /></>,
+    chat: <><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-5.5A7.5 7.5 0 1 1 20 11.5Z" /><path d="M8 11h.01M12 11h.01M16 11h.01" /></>,
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
@@ -228,7 +229,119 @@ function SellerAnalytics({ orders }) {
   );
 }
 
+function getAssistantRecommendations(message, catalog) {
+  const normalizedMessage = message.toLowerCase();
+  const categoryKeywords = {
+    Home: ['home', 'lamp', 'ceramic', 'linen', 'throw', 'room', 'decor'],
+    Tech: ['tech', 'speaker', 'headphone', 'audio', 'electronic'],
+    Travel: ['travel', 'bag', 'bottle', 'trip', 'commute'],
+    Wellness: ['wellness', 'journal', 'self-care', 'selfcare', 'mindful', 'calm'],
+  };
+  const requestedCategory = Object.entries(categoryKeywords).find(([, keywords]) =>
+    keywords.some((keyword) => normalizedMessage.includes(keyword)))?.[0];
+  const budgetMatch = normalizedMessage.match(/(?:under|below|less than|within|budget(?: of)?|up to|max(?:imum)?(?: of)?)\s*(?:₹|rs\.?\s*)?([\d,.]+)\s*(k)?/i);
+  const budget = budgetMatch
+    ? Number(budgetMatch[1].replace(/,/g, '')) * (budgetMatch[2] ? 1000 : 1)
+    : Infinity;
+  const ignoredTerms = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'you', 'your', 'can', 'could', 'would', 'show', 'find', 'want', 'need', 'help', 'recommend', 'please', 'something', 'item', 'items', 'product', 'products', 'under', 'below', 'less', 'than', 'within', 'budget', 'price', 'around', 'about']);
+  const terms = normalizedMessage
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .filter((term) => term.length > 2 && !ignoredTerms.has(term) && !/^\d/.test(term));
+
+  const rankedProducts = catalog
+    .filter((product) => (!requestedCategory || product.category === requestedCategory) && product.price <= budget)
+    .map((product) => {
+      const searchableText = `${product.name} ${product.category} ${product.badge || ''} ${product.description}`.toLowerCase();
+      const score = terms.reduce((total, term) => total + (searchableText.includes(term) ? 1 : 0), 0);
+      return { product, score };
+    })
+    .sort((first, second) => second.score - first.score || first.product.price - second.product.price)
+    .slice(0, 3)
+    .map(({ product }) => product);
+
+  if (!rankedProducts.length) {
+    const categoryText = requestedCategory ? `${requestedCategory} items` : 'items';
+    const budgetText = Number.isFinite(budget) ? ` under ${money(budget)}` : '';
+    return {
+      text: `I couldn't find ${categoryText}${budgetText} in this catalog. Try a different category or budget.`,
+      products: [],
+    };
+  }
+
+  const intro = Number.isFinite(budget)
+    ? `Here are a few options under ${money(budget)}${requestedCategory ? ` in ${requestedCategory}` : ''}:`
+    : requestedCategory
+      ? `Here are a few ${requestedCategory} options from the collection:`
+      : 'Here are a few options from the collection:';
+  return { text: intro, products: rankedProducts };
+}
+
+function ShoppingAssistant({ catalog, onViewProduct, onAddToCart }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [messages, setMessages] = useState([{
+    role: 'assistant',
+    text: 'Hi! I can help you find something from our collection. Tell me what you are looking for or share a budget.',
+    products: [],
+  }]);
+  const messageListRef = useRef(null);
+
+  useEffect(() => {
+    if (messageListRef.current) messageListRef.current.scrollTop = messageListRef.current.scrollHeight;
+  }, [messages, open]);
+
+  function sendMessage(text) {
+    const question = text.trim();
+    if (!question) return;
+    const answer = getAssistantRecommendations(question, catalog);
+    setMessages((current) => [
+      ...current,
+      { role: 'user', text: question, products: [] },
+      { role: 'assistant', ...answer },
+    ]);
+    setDraft('');
+  }
+
+  return (
+    <aside className="shopping-assistant" aria-label="Offline shopping assistant">
+      {open && <section className="assistant-panel" id="assistant-panel" role="dialog" aria-modal="false" aria-labelledby="assistant-title">
+        <header className="assistant-header">
+          <div><p>COMMONPLACE</p><h2 id="assistant-title">Product finder</h2></div>
+          <button type="button" className="assistant-close" aria-label="Close product finder" onClick={() => setOpen(false)}><Icon name="close" size={18} /></button>
+        </header>
+        <div className="assistant-messages" ref={messageListRef} aria-live="polite">
+          {messages.map((message, index) => <div className={`assistant-message ${message.role}`} key={`${index}-${message.role}`}>
+            <p>{message.text}</p>
+            {message.products.length > 0 && <ul className="assistant-products">{message.products.map((product) => <li key={product.id}>
+              <div><b>{product.name}</b><span>{money(product.price)}</span></div>
+              <div className="assistant-product-actions">
+                <button type="button" onClick={() => { onViewProduct(product); setOpen(false); }}>View details</button>
+                <button type="button" onClick={() => onAddToCart(product)}>Add to bag</button>
+              </div>
+            </li>)}</ul>}
+          </div>)}
+          {messages.length === 1 && <div className="assistant-prompts" aria-label="Suggested questions">
+            {['Travel essentials under ₹2,500', 'Help me choose something for home', 'Show me Tech products'].map((prompt) =>
+              <button type="button" key={prompt} onClick={() => sendMessage(prompt)}>{prompt}</button>)}
+          </div>}
+        </div>
+        <form className="assistant-form" onSubmit={(event) => { event.preventDefault(); sendMessage(draft); }}>
+          <label className="visually-hidden" htmlFor="assistant-question">Ask for a product recommendation</label>
+          <input id="assistant-question" value={draft} onChange={(event) => setDraft(event.target.value)} maxLength="160" placeholder="What are you looking for?" />
+          <button type="submit" disabled={!draft.trim()} aria-label="Send message"><Icon name="arrow" size={17} /></button>
+        </form>
+        <p className="assistant-disclaimer">Offline product helper · Recommendations use this store’s catalog.</p>
+      </section>}
+      <button type="button" className={`assistant-toggle${open ? ' is-open' : ''}`} aria-expanded={open} aria-controls={open ? 'assistant-panel' : undefined} onClick={() => setOpen((current) => !current)}>
+        <Icon name={open ? 'close' : 'chat'} size={19} /><span>{open ? 'Close' : 'Ask for a product'}</span>
+      </button>
+    </aside>
+  );
+}
+
 function App() {
+  const initialResetToken = new URLSearchParams(window.location.search).get('resetToken') || '';
   const [cart, setCart] = useState(readCart);
   const [sellerOrders, setSellerOrders] = useState(readOrders);
   const [category, setCategory] = useState('Everything');
@@ -242,10 +355,12 @@ function App() {
   const [notice, setNotice] = useState('');
   const [account, setAccount] = useState(null);
   const [authReady, setAuthReady] = useState(false);
-  const [accountOpen, setAccountOpen] = useState(false);
-  const [authMode, setAuthMode] = useState('login');
+  const [accountOpen, setAccountOpen] = useState(Boolean(initialResetToken));
+  const [authMode, setAuthMode] = useState(initialResetToken ? 'reset' : 'login');
   const [authMessage, setAuthMessage] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
+  const [resetToken, setResetToken] = useState(initialResetToken);
+  const [resetLink, setResetLink] = useState('');
 
   useEffect(() => {
     let active = true;
@@ -339,6 +454,69 @@ function App() {
     }
   }
 
+  function returnToSignIn() {
+    const url = new URL(window.location.href);
+    url.searchParams.delete('resetToken');
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+    setResetToken('');
+    setResetLink('');
+    setAuthMode('login');
+    setAuthMessage('');
+  }
+
+  async function submitForgotPassword(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setAuthBusy(true);
+    setAuthMessage('');
+    try {
+      const { resetToken: token } = await apiRequest('/api/auth/forgot-password', {
+        method: 'POST',
+        body: JSON.stringify({ email: String(form.get('email') || '').trim() }),
+      });
+      setResetToken(token);
+      const url = new URL(window.location.href);
+      url.searchParams.set('resetToken', token);
+      setResetLink(url.toString());
+      setAuthMode('reset-link');
+    } catch (error) {
+      setAuthMessage(error.message);
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function submitPasswordReset(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const password = String(form.get('password') || '');
+    if (password !== String(form.get('confirmPassword') || '')) {
+      setAuthMessage('The passwords do not match.');
+      return;
+    }
+
+    setAuthBusy(true);
+    setAuthMessage('');
+    try {
+      await apiRequest('/api/auth/reset-password', {
+        method: 'POST',
+        body: JSON.stringify({ token: resetToken, password }),
+      });
+      const url = new URL(window.location.href);
+      url.searchParams.delete('resetToken');
+      window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+      setResetToken('');
+      setAccount(null);
+      setAccountOpen(false);
+      setAuthMode('login');
+      setNotice('Password reset. Sign in with your new password.');
+    } catch (error) {
+      setAuthMessage(error.message);
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
   async function logout() {
     setAuthBusy(true);
     setAuthMessage('');
@@ -347,6 +525,28 @@ function App() {
       setAccount(null);
       setAccountOpen(false);
       setNotice('You’ve been signed out.');
+    } catch (error) {
+      setAuthMessage(error.message);
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function submitProfile(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setAuthBusy(true);
+    setAuthMessage('');
+    try {
+      const { user } = await apiRequest('/api/auth/profile', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          name: String(form.get('name') || '').trim(),
+          email: String(form.get('email') || '').trim(),
+        }),
+      });
+      setAccount(user);
+      setNotice('Your profile has been saved.');
     } catch (error) {
       setAuthMessage(error.message);
     } finally {
@@ -383,7 +583,8 @@ function App() {
 
   return (
     <div className="storefront">
-      <div className="announcement">Complimentary delivery on orders above {money(freeShippingThreshold)} <span>✳</span></div>
+      <a className="skip-link" href="#shop">Skip to products</a>
+      <div className="announcement">Complimentary delivery on orders of {money(freeShippingThreshold)} or more <span>✳</span></div>
       <header className="site-header">
         <a className="wordmark" href="#home" aria-label="Commonplace home">commonplace<span>.</span></a>
         <nav className="desktop-nav" aria-label="Main navigation">
@@ -436,38 +637,91 @@ function App() {
           {visibleProducts.length ? <div className="product-grid">{visibleProducts.map((product) => <ProductCard key={product.id} product={product} addToCart={addToCart} openProduct={setSelectedProduct} />)}</div> : <div className="empty-search"><span>Nothing on this shelf just yet.</span><button onClick={() => { setQuery(''); setCategory('Everything'); }}>See everything <Icon name="arrow" size={16} /></button></div>}
         </section>
 
+        <section className="shopping-information" id="shopping-information" aria-labelledby="shopping-information-heading">
+          <div className="section-heading">
+            <div><p className="eyebrow">GOOD TO KNOW</p><h2 id="shopping-information-heading">The details, <em>made clear.</em></h2></div>
+            <p>Helpful information before you add something to your everyday.</p>
+          </div>
+          <div className="shopping-information-grid">
+            <article>
+              <span className="information-index">01 / DELIVERY</span>
+              <h3>Simple shipping</h3>
+              <p>Delivery is ₹99 on orders below {money(freeShippingThreshold)}. Orders of {money(freeShippingThreshold)} or more ship free.</p>
+            </article>
+            <article>
+              <span className="information-index">02 / CHECKOUT</span>
+              <h3>A transparent demo</h3>
+              <p>Checkout demonstrates pay on delivery. It does not process payments, send emails, or create a real shipment.</p>
+            </article>
+            <article>
+              <span className="information-index">03 / REVIEWS</span>
+              <h3>Reviews from signed-in customers</h3>
+              <p>Sign in to leave one rating and review per product. You can update your review later.</p>
+            </article>
+          </div>
+        </section>
+
         <SellerAnalytics orders={sellerOrders} />
         <section className="closing-banner"><div><p className="eyebrow">A THOUGHTFUL LITTLE NOTE</p><h2>Good things take<br /><em>a little thought.</em></h2><p>We think about the details, so you don’t have to.</p></div><a href="#shop" className="light-button">Meet your new favorite <Icon name="arrow" size={17} /></a><span className="closing-flower">✳</span></section>
       </main>
-      <footer className="site-footer"><a className="wordmark" href="#home">commonplace<span>.</span></a><p>Fewer things. Better days. <a href="#seller">Seller analysis</a></p><span>© 2026 Commonplace Goods</span></footer>
+      <footer className="site-footer">
+        <div className="footer-brand"><a className="wordmark" href="#home">commonplace<span>.</span></a><p>Fewer things. Better days.</p></div>
+        <nav className="footer-links" aria-label="Explore the store"><b>Explore</b><a href="#shop">Shop all</a><a href="#story">Our approach</a><a href="#seller">Seller analysis</a></nav>
+        <nav className="footer-links" aria-label="Store information"><b>Store information</b><a href="#shopping-information">Delivery & checkout</a><a href="#shopping-information">Product reviews</a><a href="#home">Back to top</a></nav>
+        <div className="footer-note"><span>DEMO STOREFRONT</span><p>Orders and analytics are demonstrations. No payment is processed.</p></div>
+        <div className="footer-bottom"><span>© 2026 Commonplace Goods</span><span>Thoughtful things for everyday living.</span></div>
+      </footer>
 
       {notice && <div className="toast" role="status"><Icon name="check" size={17} />{notice}</div>}
 
+      <ShoppingAssistant catalog={products} onViewProduct={setSelectedProduct} onAddToCart={addToCart} />
+
       {accountOpen && <Overlay className="account-overlay" onClose={() => setAccountOpen(false)}><div className="account-modal">
         <button className="modal-close icon-button" onClick={() => setAccountOpen(false)} aria-label="Close account"><Icon name="close" /></button>
-        {account ? <>
+        {account && authMode !== 'reset' ? <>
           <p className="eyebrow">YOUR COMMONPLACE</p>
-          <h2>Hello, {account.name.split(' ')[0]}.</h2>
-          <p className="account-email">{account.email}</p>
-          {authMessage && <p className="auth-error" role="alert">{authMessage}</p>}
-          <button className="dark-button auth-submit" type="button" disabled={authBusy} onClick={logout}>{authBusy ? 'Signing out…' : 'Sign out'} <Icon name="arrow" size={17} /></button>
+          <h2>Your profile.</h2>
+          <p className="auth-intro">Keep your account details up to date.</p>
+          <form className="auth-form profile-form" onSubmit={submitProfile}>
+            <label>Full name<input name="name" autoComplete="name" required maxLength="80" defaultValue={account.name} /></label>
+            <label>Email address<input name="email" type="email" autoComplete="email" required maxLength="254" defaultValue={account.email} /></label>
+            {authMessage && <p className="auth-error" role="alert">{authMessage}</p>}
+            <button className="dark-button auth-submit" type="submit" disabled={authBusy}>{authBusy ? 'Saving…' : 'Save profile'} <Icon name="arrow" size={17} /></button>
+          </form>
+          <button className="profile-signout" type="button" disabled={authBusy} onClick={logout}>{authBusy ? 'Please wait…' : 'Sign out'}</button>
         </> : <>
-          <p className="eyebrow">{authMode === 'signup' ? 'A GOOD PLACE TO START' : 'WELCOME BACK'}</p>
-          <h2>{authMode === 'signup' ? 'Create your account.' : 'Sign in to your account.'}</h2>
-          <p className="auth-intro">{authMode === 'signup' ? 'Save your details and make your next visit feel like yours.' : 'Good to have you back. Pick up where you left off.'}</p>
-          <div className="auth-tabs" role="tablist" aria-label="Account access">
+          <p className="eyebrow">{authMode === 'signup' ? 'A GOOD PLACE TO START' : ['forgot', 'reset-link', 'reset'].includes(authMode) ? 'ACCOUNT RECOVERY' : 'WELCOME BACK'}</p>
+          <h2>{authMode === 'signup' ? 'Create your account.' : authMode === 'forgot' ? 'Forgot your password?' : authMode === 'reset-link' ? 'Your local reset link is ready.' : authMode === 'reset' ? 'Choose a new password.' : 'Sign in to your account.'}</h2>
+          <p className="auth-intro">{authMode === 'signup' ? 'Save your details and make your next visit feel like yours.' : authMode === 'forgot' ? 'Enter your email to create a one-time reset link. This local demo does not send email.' : authMode === 'reset-link' ? 'No email was sent. Open this one-time link within 15 minutes.' : authMode === 'reset' ? 'Choose a new password. You will need to sign in again after resetting it.' : 'Good to have you back. Pick up where you left off.'}</p>
+          {['login', 'signup'].includes(authMode) && <div className="auth-tabs" role="tablist" aria-label="Account access">
             <button type="button" role="tab" aria-selected={authMode === 'login'} className={authMode === 'login' ? 'active' : ''} onClick={() => { setAuthMode('login'); setAuthMessage(''); }}>Sign in</button>
             <button type="button" role="tab" aria-selected={authMode === 'signup'} className={authMode === 'signup' ? 'active' : ''} onClick={() => { setAuthMode('signup'); setAuthMessage(''); }}>Create account</button>
-          </div>
-          <form className="auth-form" onSubmit={submitAuth}>
+          </div>}
+          {['login', 'signup'].includes(authMode) && <form className="auth-form" onSubmit={submitAuth}>
             {authMode === 'signup' && <label>Full name<input name="name" autoComplete="name" required maxLength="80" placeholder="Jamie Taylor" /></label>}
             <label>Email address<input name="email" type="email" autoComplete="email" required maxLength="254" placeholder="you@example.com" /></label>
             <label>Password<input name="password" type="password" autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'} required minLength={authMode === 'signup' ? 8 : undefined} maxLength="128" placeholder={authMode === 'signup' ? 'At least 8 characters' : 'Your password'} /></label>
             {authMode === 'signup' && <label className="auth-terms"><input type="checkbox" name="termsAccepted" required /><span>I agree to the store terms and privacy policy.</span></label>}
             {authMessage && <p className="auth-error" role="alert">{authMessage}</p>}
             <button className="dark-button auth-submit" type="submit" disabled={authBusy}>{authBusy ? 'Please wait…' : authMode === 'signup' ? 'Create account' : 'Sign in'} <Icon name="arrow" size={17} /></button>
-          </form>
-          <p className="auth-security">Your password is securely hashed by the server. We never store it in your browser.</p>
+          </form>}
+          {authMode === 'login' && <button className="auth-text-button" type="button" onClick={() => { setAuthMode('forgot'); setAuthMessage(''); }}>Forgot your password?</button>}
+          {authMode === 'forgot' && <form className="auth-form" onSubmit={submitForgotPassword}>
+            <label>Email address<input name="email" type="email" autoComplete="email" required maxLength="254" placeholder="you@example.com" /></label>
+            {authMessage && <p className="auth-error" role="alert">{authMessage}</p>}
+            <button className="dark-button auth-submit" type="submit" disabled={authBusy}>{authBusy ? 'Please wait…' : 'Create reset link'} <Icon name="arrow" size={17} /></button>
+          </form>}
+          {authMode === 'reset-link' && <div className="auth-reset-ready" aria-live="polite">
+            <a className="dark-button auth-submit" href={resetLink}>Open local reset link <Icon name="arrow" size={17} /></a>
+          </div>}
+          {authMode === 'reset' && <form className="auth-form" onSubmit={submitPasswordReset}>
+            <label>New password<input name="password" type="password" autoComplete="new-password" required minLength="8" maxLength="128" placeholder="At least 8 characters" /></label>
+            <label>Confirm new password<input name="confirmPassword" type="password" autoComplete="new-password" required minLength="8" maxLength="128" placeholder="Enter it again" /></label>
+            {authMessage && <p className="auth-error" role="alert">{authMessage}</p>}
+            <button className="dark-button auth-submit" type="submit" disabled={authBusy}>{authBusy ? 'Please wait…' : 'Reset password'} <Icon name="arrow" size={17} /></button>
+          </form>}
+          {['forgot', 'reset-link', 'reset'].includes(authMode) && <button className="auth-text-button" type="button" onClick={returnToSignIn}>Back to sign in</button>}
+          {['login', 'signup'].includes(authMode) && <p className="auth-security">Your password is securely hashed by the server. We never store it in your browser.</p>}
         </>}
       </div></Overlay>}
 
